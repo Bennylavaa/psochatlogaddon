@@ -1,7 +1,7 @@
 local core_mainmenu = require("core_mainmenu")
 local cfg = require("Chatlog.configuration")
 local optionsLoaded, options = pcall(require, "Chatlog.options")
-local image = require("solylib.image")
+local image = require("Chatlog.image")
 
 local optionsFileName = "addons/Chatlog/options.lua"
 local firstPresent = true
@@ -119,6 +119,7 @@ if optionsLoaded then
     options.enable                    = NotNilOrDefault(options.enable, true)
     options.useCustomTheme            = NotNilOrDefault(options.useCustomTheme, false)
     options.fontScale                 = NotNilOrDefault(options.fontScale, 1.0)
+    options.toolbarFontScale          = NotNilOrDefault(options.toolbarFontScale, 1.0)
 
     options.clEnableWindow            = NotNilOrDefault(options.clEnableWindow, true)
     options.clHideWhenMenu            = NotNilOrDefault(options.clHideWhenMenu, true)
@@ -172,6 +173,7 @@ else
         enable = true,
         useCustomTheme = false,
         fontScale = 1.0,
+        toolbarFontScale = 1.0,
 
         clEnableWindow = true,
         clHideWhenMenu = true,
@@ -232,6 +234,7 @@ local function SaveOptions(options)
         io.write(string.format("    enable = %s,\n", tostring(options.enable)))
         io.write(string.format("    useCustomTheme = %s,\n", tostring(options.useCustomTheme)))
         io.write(string.format("    fontScale = %s,\n", tostring(options.fontScale)))
+        io.write(string.format("    toolbarFontScale = %s,\n", tostring(options.toolbarFontScale)))
         io.write("\n")
         io.write(string.format("    clEnableWindow = %s,\n", tostring(options.clEnableWindow)))
         io.write(string.format("    clHideWhenMenu = %s,\n", tostring(options.clHideWhenMenu)))
@@ -287,6 +290,11 @@ end
 
 local CHAT_PTR = 0x00A9A920
 local prevmaxy = 0
+-- One-shot: snap to bottom the first time we have measurable content. The
+-- normal follow-bottom logic in DoChat can't do this on the opening frame
+-- because GetScrollMaxY hasn't been measured yet (returns 0), so prevmaxy
+-- stays 0 and the "grew taller" check never fires.
+local needsInitialScroll = true
 -- E english
 -- J japonese
 -- B simple chinese
@@ -302,7 +310,6 @@ local QCHAT_REPLACE = "(> )\t[" .. LOCALES .. "]"
 local MAX_GAME_LOG = 29 -- max amount of messages the game stores
 local MAX_MSG_SIZE = 100 -- not correct but close enough, character name length seems to affect it
 local output_messages = {}
-local scrolldown = false
 
 -- Team chat lives in a separate fixed-slot ring buffer (no pointer indirection
 -- like lobby uses). Stride per slot is 0x120 bytes; 30 slots total.
@@ -546,16 +553,51 @@ local function lookup_player_info(name)
     return player_info_cache[key]
 end
 
+-- Walk output_messages backward looking for the most recent message by the
+-- same player that has class/section info. Used as a fallback when the live
+-- player cache doesn't know the speaker — e.g. addon reload re-imports the
+-- in-game chat buffer's 30-message tail, but the speaker has since left the
+-- lobby. Their earlier (pre-reload) messages, restored from disk, still
+-- carry the [c=N s=M] metadata we wrote at original capture time.
+local function find_historical_player_info(name)
+    if not name or name == "" then return nil end
+    local lowerName = string.lower(name)
+    for i = #output_messages, 1, -1 do
+        local m = output_messages[i]
+        if m.name and string.lower(m.name) == lowerName then
+            if m.class or m.sectionId then
+                return { class = m.class, sectionId = m.sectionId }
+            end
+        end
+    end
+    return nil
+end
+
 -- Stamp class/sectionId onto a message in place.
 local function stamp_player_info(msg)
     local info = lookup_player_info(msg.name)
     if info then
         msg.class = info.class
         msg.sectionId = info.sectionId
+        return
+    end
+    -- Live cache miss (player offline / not in this area). Try the chat
+    -- history before giving up so re-imports after reload don't lose their
+    -- colors.
+    local historical = find_historical_player_info(msg.name)
+    if historical then
+        if msg.class == nil then msg.class = historical.class end
+        if msg.sectionId == nil then msg.sectionId = historical.sectionId end
     end
 end
 
--- Append a single message to the daily log file. Cheap to open/close per line
+-- Single append-only log file. Each line carries its own date so we can still
+-- show "MM-DD HH:MM:SS" prefixes for messages from previous days. Previously
+-- the addon wrote one file per day; migrate_old_logs() at init time merges
+-- any leftover daily files into this one and deletes them.
+local LOG_FILE = "addons/Chatlog/log.txt"
+
+-- Append a single message to the log file. Cheap to open/close per line
 -- since chat volume is low; survives crashes without losing data.
 --
 -- Format: "YYYY-MM-DD HH:MM:SS [L|T] [c=N s=M] Name: body"
@@ -565,8 +607,7 @@ end
 -- load_persisted_messages.
 local function write_log_line(msg)
     if not options.clLogToFile then return end
-    local path = "addons/Chatlog/log-" .. os.date("%Y-%m-%d") .. ".txt"
-    local file = io.open(path, "a")
+    local file = io.open(LOG_FILE, "a")
     if file then
         local channel = msg.channel == "team" and "T" or "L"
         file:write(string.format(
@@ -694,34 +735,52 @@ local function write_clear_marker()
     end
 end
 
--- Walk back up to a week to find the most recent log file. Returns the path
--- (or nil) and whether it's today's. We allow older files so players who
--- haven't logged in for a few days still see their last session on startup.
-local function find_recent_log()
-    for daysBack = 0, 7 do
-        local timestamp = os.time() - daysBack * 86400
-        local path = "addons/Chatlog/log-" .. os.date("%Y-%m-%d", timestamp) .. ".txt"
+-- One-time migration from the old per-day file scheme (log-YYYY-MM-DD.txt)
+-- into the single LOG_FILE. Walks back a year to find leftover daily files,
+-- appends them into LOG_FILE in chronological order, and deletes them.
+-- Idempotent: a second run finds no daily files and does nothing. Runs once
+-- at init() before load_persisted_messages so the merge is visible to the
+-- restore step.
+local function migrate_old_logs()
+    local found = {}
+    for daysBack = 0, 365 do
+        local ts = os.time() - daysBack * 86400
+        local path = "addons/Chatlog/log-" .. os.date("%Y-%m-%d", ts) .. ".txt"
         local f = io.open(path, "r")
         if f then
             f:close()
-            return path
+            table.insert(found, path)
         end
     end
-    return nil
+    if #found == 0 then return end
+
+    local out = io.open(LOG_FILE, "a")
+    if not out then return end
+    -- `found` is newest-first (we walked backward); iterate in reverse so
+    -- entries land in LOG_FILE oldest-first, preserving chronological order.
+    for i = #found, 1, -1 do
+        local f = io.open(found[i], "r")
+        if f then
+            for line in f:lines() do
+                out:write(line)
+                out:write("\n")
+            end
+            f:close()
+            os.remove(found[i])
+        end
+    end
+    out:close()
 end
 
--- Read the last N lines of the most recent log file and seed output_messages
--- (and lobby_align, so the next tick's find_new_start deduplicates against
--- whatever is still in the game's 30-message ring buffer). Messages from
--- previous days are prefixed with "MM-DD" to make staleness visible.
+-- Read the last N lines of LOG_FILE and seed output_messages (and lobby_align,
+-- so the next tick's find_new_start deduplicates against whatever is still in
+-- the game's 30-message ring buffer). Messages from previous days are
+-- prefixed with "MM-DD" to make staleness visible.
 local function load_persisted_messages()
     if not options.clRestoreOnStartup then return end
     if (options.clRestoreLines or 0) <= 0 then return end
 
-    local path = find_recent_log()
-    if not path then return end
-
-    local file = io.open(path, "r")
+    local file = io.open(LOG_FILE, "r")
     if not file then return end
 
     local lines = {}
@@ -790,6 +849,36 @@ local function load_persisted_messages()
     -- Cap lobby_align to MAX_GAME_LOG so find_new_start has a sensible window.
     while #lobby_align > MAX_GAME_LOG do
         table.remove(lobby_align, 1)
+    end
+
+    -- Backfill missing class/sectionId across restored messages. If an old
+    -- log entry recorded the player's class/section (e.g. Cacha c=9 s=1
+    -- when she was visible) and a later entry was written with c=-1 s=-1
+    -- (e.g. a post-reload re-import of the game's chat buffer after she
+    -- left), propagate the known info onto the unknown entries so the
+    -- renderer can color them. Two passes: gather everything we know, then
+    -- apply. Handles both directions (early-unknown / late-known and
+    -- vice versa).
+    local known = {}
+    for i = 1, #output_messages do
+        local m = output_messages[i]
+        if m.name and m.name ~= "" and (m.class ~= nil or m.sectionId ~= nil) then
+            local key = string.lower(m.name)
+            local k = known[key] or {}
+            if m.class ~= nil then k.class = m.class end
+            if m.sectionId ~= nil then k.sectionId = m.sectionId end
+            known[key] = k
+        end
+    end
+    for i = 1, #output_messages do
+        local m = output_messages[i]
+        if m.name and m.name ~= "" then
+            local k = known[string.lower(m.name)]
+            if k then
+                if m.class == nil and k.class ~= nil then m.class = k.class end
+                if m.sectionId == nil and k.sectionId ~= nil then m.sectionId = k.sectionId end
+            end
+        end
     end
 end
 
@@ -964,14 +1053,41 @@ local function DoChat()
     -- Wrap rendering in a child window so the search bar stays pinned.
     imgui.BeginChild("chatscroll", 0, 0, false)
 
-    -- Scroll check happens every frame so the user-at-bottom signal updates
-    -- as soon as they wheel away or back, not just on capture cycles.
+    -- Font scale only applies to the message body, not the toolbar. ImGui's
+    -- per-window FontScale doesn't propagate from parent to child, so we set
+    -- it here rather than in present(). Side effect: imgui.GetTextLineHeight()
+    -- inside the message loop returns the scaled value, which keeps the
+    -- section-ID icons sized to match the chat text.
+    imgui.SetWindowFontScale(options.fontScale)
+
+    -- Snap to bottom only on the frame where the chat actually got taller
+    -- (a new message was rendered) AND the user was sitting at the previous
+    -- bottom. Doing it every frame breaks the mouse wheel: SetScrollY queues
+    -- a ScrollTarget that the *next* frame's BeginChild applies, which would
+    -- overwrite the wheel scroll that NewFrame applied between user-code
+    -- runs. Tying it to content growth means we only re-pin to bottom when
+    -- there's a reason to, leaving the wheel free the rest of the time.
+    --
+    -- Exception: the very first time the chat is shown (and on each
+    -- subsequent hide→show), we force a snap to bottom regardless of the
+    -- "grew taller" check, since GetScrollMaxY returns 0 on the opening
+    -- frame and the normal logic would miss it. The flag clears as soon as
+    -- we see a non-zero maxY so this stays a one-shot per show.
     do
         local sy = imgui.GetScrollY()
-        if sy <= 0 or prevmaxy == sy then
-            scrolldown = true
+        local maxY = imgui.GetScrollMaxY()
+        if needsInitialScroll then
+            if maxY > 0 then
+                imgui.SetScrollY(maxY)
+                prevmaxy = maxY
+                needsInitialScroll = false
+            end
         else
-            scrolldown = false
+            local atOldBottom = math.abs(sy - prevmaxy) < 1
+            if maxY > prevmaxy + 0.5 and atOldBottom then
+                imgui.SetScrollY(maxY)
+            end
+            prevmaxy = maxY
         end
     end
 
@@ -1170,11 +1286,6 @@ local function DoChat()
 
     imgui.PopTextWrapPos()
 
-    if scrolldown then
-        imgui.SetScrollY(imgui.GetScrollMaxY())
-    end
-    prevmaxy = imgui.GetScrollMaxY()
-
     imgui.EndChild()
 end
 
@@ -1219,7 +1330,10 @@ local function present()
             imgui.PushStyleColor("WindowBg", 0.0, 0.0, 0.0, 0.0)
         end
         if imgui.Begin("Chatlog", nil, { options.clNoTitleBar, options.clNoResize, options.clNoMove }) then
-            imgui.SetWindowFontScale(options.fontScale)
+            -- Toolbar (buttons, search bar) lives in this parent window. The
+            -- message body has its own SetWindowFontScale call inside the
+            -- child window — see DoChat.
+            imgui.SetWindowFontScale(options.toolbarFontScale)
             DoChat()
         end
         imgui.End()
@@ -1242,18 +1356,19 @@ local function init()
             -- the bootstrap branch checks to avoid resurfacing the game's
             -- in-memory ring buffer (separate from the log file).
             write_clear_marker()
-            -- Delete daily log files within the 7-day restore window —
-            -- matches find_recent_log's scope. Files older than that won't
-            -- be re-read anyway. os.remove silently no-ops if missing.
-            for daysBack = 0, 7 do
-                local ts = os.time() - daysBack * 86400
-                local path = "addons/Chatlog/log-" .. os.date("%Y-%m-%d", ts) .. ".txt"
-                os.remove(path)
-            end
+            -- Wipe the single log file. The clear marker above is the
+            -- belt-and-suspenders fallback if the delete fails (file locked,
+            -- permissions): restore-on-load still skips everything older
+            -- than the marker timestamp. os.remove silently no-ops if missing.
+            os.remove(LOG_FILE)
             -- Keep lobby_align populated so the next tick won't re-bootstrap
             -- the in-game buffer's 30 messages back into the visible log.
         end,
     })
+
+    -- Fold any leftover per-day log files into the single LOG_FILE before
+    -- the restore step reads it. Idempotent on subsequent launches.
+    migrate_old_logs()
 
     -- Pull recent history off disk so the chat window doesn't start empty
     -- after a relaunch. Depends on clLogToFile having been on previously;

@@ -126,7 +126,12 @@ local function ConfigurationWindow(configuration, callbacks)
                 this.changed = true
             end
 
-            success, _configuration.fontScale = imgui.InputFloat("Font Scale", _configuration.fontScale)
+            success, _configuration.fontScale = imgui.InputFloat("Message Font Scale", _configuration.fontScale)
+            if success then
+                this.changed = true
+            end
+
+            success, _configuration.toolbarFontScale = imgui.InputFloat("Toolbar Font Scale", _configuration.toolbarFontScale)
             if success then
                 this.changed = true
             end
